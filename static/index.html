@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Video Splitter Web Client</title>
+  <style>
+    body {
+      margin: 20px;
+      font-family: Arial, sans-serif;
+      background: white;
+      color: black;
+    }
+    h1, h2, h3 {
+      margin-top: 0;
+      font-size: 18px;
+    }
+    input, select, button {
+      padding: 6px 8px;
+      margin: 4px 0;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      font-size: 14px;
+    }
+    button { cursor: pointer; }
+    .section {
+      border: 1px solid #ddd;
+      padding: 12px;
+      margin-bottom: 16px;
+    }
+    .row { margin-bottom: 8px; }
+    .status {
+      font-weight: bold;
+      margin-top: 6px;
+    }
+    .small { font-size: 12px; color: gray; }
+    .list { margin-top: 8px; }
+    .list-item {
+      padding: 6px;
+      border: 1px solid #ddd;
+      margin-bottom: 6px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Video Splitter Web Client</h1>
+
+  <div class="section">
+    <h2>API Settings</h2>
+    <label>API Base:</label>
+    <input id="apiBase" size="40">
+    <button id="saveApi">Save</button>
+  </div>
+
+  <div class="section">
+    <h2>Authentication</h2>
+    <div class="row"><label>Username</label><br><input id="username"></div>
+    <div class="row"><label>Password</label><br><input id="password" type="password"></div>
+    <button id="loginBtn">Login</button>
+    <button id="logoutBtn">Logout</button>
+    <div class="status" id="authStatus">Logged out</div>
+    <div class="small">Use admin/admin123 or user/user123</div>
+  </div>
+
+  <div class="section">
+    <h2>Upload Video</h2>
+    <input type="file" id="fileInput" accept="video/*">
+    <button id="uploadBtn">Upload</button>
+    <div id="uploadMsg" class="small"></div>
+  </div>
+
+  <div class="section">
+    <h2>Your Videos</h2>
+    <button id="refreshVideos">Refresh</button>
+    <div id="videosList" class="list"></div>
+    <div id="vidCount" class="small"></div>
+  </div>
+
+  <div class="section" id="videoPanel" style="display:none;">
+    <h2>Video Details</h2>
+    <div class="row"><label>Video ID</label><br><input id="videoId" readonly></div>
+    <div class="row"><label>Filename</label><br><input id="videoFilename" readonly></div>
+    <div class="row"><label>Duration (s)</label><br><input id="videoDuration" readonly></div>
+
+    <h3>Split</h3>
+    <label>Mode:</label>
+    <select id="splitMode">
+      <option value="heavy">Heavy (re-encode)</option>
+      <option value="fast">Fast (copy)</option>
+    </select>
+    <label>Parts:</label>
+    <input id="splitParts" type="number" min="2" value="10">
+    <button id="splitAsyncBtn">Split (async)</button>
+    <button id="splitSyncBtn">Split (sync)</button>
+    <div id="jobStatus" class="status">No job</div>
+    <button id="pollJobBtn">Poll Job</button>
+
+    <h3>Segments</h3>
+    <button id="loadSegments">List Segments</button>
+    <div id="segmentsGrid" class="list"></div>
+  </div>
+
+  <script>
+    // ---------- Config ----------
+    const apiBaseInput = document.getElementById('apiBase');
+    const DEFAULT_API = (location.origin.includes('localhost')||location.origin.includes('127.0.0.1')) 
+      ? 'http://localhost:8000' : location.origin;
+    apiBaseInput.value = localStorage.getItem('apiBase') || DEFAULT_API;
+    document.getElementById('saveApi').onclick = () => {
+      localStorage.setItem('apiBase', apiBaseInput.value.trim());
+      alert('Saved API base');
+    };
+    function apiBase(){ return (localStorage.getItem('apiBase') || DEFAULT_API).replace(/\/$/, ''); }
+
+    // ---------- Auth ----------
+    let token = localStorage.getItem('jwt') || '';
+    let role = localStorage.getItem('role') || '';
+    const authStatus = document.getElementById('authStatus');
+    function setAuthStatus(){ authStatus.textContent = token ? `Logged in (${role||'user'})` : 'Logged out'; }
+    setAuthStatus();
+
+    document.getElementById('loginBtn').onclick = async () => {
+      const username = document.getElementById('username').value.trim();
+      const password = document.getElementById('password').value;
+      try {
+        const res = await fetch(apiBase()+"/auth/login",{
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({username,password})
+        });
+        if(!res.ok) throw new Error('Login failed');
+        const data = await res.json();
+        token = data.token; role = data.role || '';
+        localStorage.setItem('jwt', token); localStorage.setItem('role', role);
+        setAuthStatus(); alert('Logged in');
+      } catch(e){ alert(e.message); }
+    };
+
+    document.getElementById('logoutBtn').onclick = () => {
+      token=''; role=''; localStorage.removeItem('jwt'); localStorage.removeItem('role');
+      setAuthStatus(); alert('Logged out');
+    };
+
+    function authHeaders(){ return token ? { 'Authorization': 'Bearer '+token } : {}; }
+
+    // ---------- Upload ----------
+    const uploadBtn = document.getElementById('uploadBtn');
+    const uploadMsg = document.getElementById('uploadMsg');
+    uploadBtn.onclick = async () => {
+      const f = document.getElementById('fileInput').files[0];
+      if(!f) return alert('Choose a video file');
+      const fd = new FormData(); fd.append('file', f, f.name);
+      uploadBtn.disabled = true; uploadMsg.textContent = 'Uploading...';
+      try{
+        const res = await fetch(apiBase()+"/videos/upload",{
+          method:'POST', headers: authHeaders(), body: fd
+        });
+        if(!res.ok) throw new Error('Upload failed ('+res.status+")");
+        const data = await res.json();
+        uploadMsg.textContent = `Uploaded ${data.filename||f.name} (id: ${data.video_id})`;
+        await loadVideos();
+      }catch(e){ uploadMsg.textContent = e.message; }
+      finally{ uploadBtn.disabled = false; }
+    };
+
+    // ---------- Videos ----------
+    const videosList = document.getElementById('videosList');
+    const vidCount = document.getElementById('vidCount');
+    document.getElementById('refreshVideos').onclick = loadVideos;
+
+    async function loadVideos(){
+      videosList.textContent = 'Loading...';
+      try{
+        const res = await fetch(apiBase()+"/videos?page=1&page_size=50",{ headers: authHeaders() });
+        if(!res.ok) throw new Error('Failed to load videos');
+        const data = await res.json();
+        vidCount.textContent = `${data.total||0} video(s)`;
+        videosList.innerHTML = '';
+        (data.videos||[]).forEach(v => {
+          const el = document.createElement('div'); el.className='list-item';
+          el.innerHTML = `<b>${v.filename||'video'}</b><br>
+                          id: ${v.video_id}, duration: ${v.duration}s<br>
+                          <button data-id="${v.video_id}">Open</button>`;
+          el.querySelector('button').onclick = ()=> openVideo(v.video_id);
+          videosList.appendChild(el);
+        });
+      }catch(e){ videosList.textContent = e.message; }
+    }
+
+    // ---------- Video Panel ----------
+    const videoPanel = document.getElementById('videoPanel');
+    const videoIdIn = document.getElementById('videoId');
+    const videoFilenameIn = document.getElementById('videoFilename');
+    const videoDurationIn = document.getElementById('videoDuration');
+    const jobStatus = document.getElementById('jobStatus');
+
+    async function openVideo(id){
+      try{
+        const res = await fetch(apiBase()+`/videos/${id}`,{ headers: authHeaders() });
+        if(!res.ok) throw new Error('Failed to fetch video');
+        const v = await res.json();
+        videoPanel.style.display='block';
+        videoIdIn.value = v.video_id; videoFilenameIn.value = v.filename; videoDurationIn.value = v.duration;
+        await listSegments();
+      }catch(e){ alert(e.message); }
+    }
+
+    // ---------- Split ----------
+    document.getElementById('splitAsyncBtn').onclick = async () => {
+      const id = videoIdIn.value; if(!id) return;
+      const mode = document.getElementById('splitMode').value; 
+      const parts = parseInt(document.getElementById('splitParts').value||'10',10);
+      jobStatus.textContent = 'Queued...';
+      try{
+        const res = await fetch(apiBase()+`/videos/${id}/split_async?parts=${parts}&mode=${mode}`,{
+          method:'POST', headers: authHeaders()
+        });
+        if(!res.ok) throw new Error('Split async failed');
+        jobStatus.textContent = 'Queued';
+        pollJob(id,true);
+      }catch(e){ jobStatus.textContent = e.message; }
+    };
+
+    document.getElementById('splitSyncBtn').onclick = async () => {
+      const id = videoIdIn.value; if(!id) return;
+      const mode = document.getElementById('splitMode').value; 
+      const parts = parseInt(document.getElementById('splitParts').value||'10',10);
+      jobStatus.textContent = 'Processing...';
+      try{
+        const res = await fetch(apiBase()+`/videos/${id}/split?parts=${parts}&mode=${mode}`,{
+          method:'POST', headers: authHeaders()
+        });
+        if(!res.ok) throw new Error('Split sync failed');
+        const data = await res.json();
+        jobStatus.textContent = `Done: ${data.parts} parts`;
+        await listSegments();
+      }catch(e){ jobStatus.textContent = e.message; }
+    };
+
+    document.getElementById('pollJobBtn').onclick = ()=>{ const id = videoIdIn.value; if(id) pollJob(id,false); };
+
+    async function pollJob(id, auto){
+      try{
+        const res = await fetch(apiBase()+`/jobs/${id}`,{ headers: authHeaders() });
+        if(!res.ok) throw new Error('Job not found');
+        const j = await res.json();
+        jobStatus.textContent = `Status: ${j.status}` + (j.parts?` • parts: ${j.parts}`:'');
+        if(j.status==='done'){ await listSegments(); return; }
+        if(j.status==='error'){ return; }
+        if(auto){ setTimeout(()=>pollJob(id,true),2500); }
+      }catch(e){ jobStatus.textContent = e.message; }
+    }
+
+    // ---------- Segments ----------
+    const segmentsGrid = document.getElementById('segmentsGrid');
+    document.getElementById('loadSegments').onclick = listSegments;
+
+    async function listSegments(){
+      const id = videoIdIn.value; if(!id) return;
+      segmentsGrid.textContent = 'Loading segments...';
+      try{
+        const res = await fetch(apiBase()+`/videos/${id}/segments`,{ headers: authHeaders() });
+        if(!res.ok) throw new Error('Failed to list segments');
+        const data = await res.json();
+        const outputs = data.outputs||[];
+        if(outputs.length===0){ segmentsGrid.textContent = 'No segments yet'; return; }
+        segmentsGrid.innerHTML='';
+        outputs.forEach(group => {
+          const title = document.createElement('div'); title.textContent = `Mode: ${group.mode}, Parts: ${group.parts}`;
+          segmentsGrid.appendChild(title);
+          group.segments.forEach((url, idx) => {
+            const div = document.createElement('div'); div.className='list-item';
+            const fname = `part_${String(idx).padStart(2,'0')}.mp4`;
+            div.innerHTML = `${fname} <button>Download</button>`;
+            div.querySelector('button').onclick = () => downloadWithAuth(url, fname);
+            segmentsGrid.appendChild(div);
+          });
+        });
+      }catch(e){ segmentsGrid.textContent = e.message; }
+    }
+
+    async function downloadWithAuth(url, filename){
+      try{
+        const res = await fetch(apiBase()+url, { headers: authHeaders() });
+        if(!res.ok) throw new Error('Download failed');
+        const blob = await res.blob();
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = filename;
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(()=> URL.revokeObjectURL(a.href),1000);
+      }catch(e){ alert(e.message); }
+    }
+
+    // Auto-load videos if logged in
+    if(token){ loadVideos(); }
+  </script>
+</body>
+</html>
