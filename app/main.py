@@ -54,7 +54,7 @@ ddb = boto3.client("dynamodb", region_name=AWS_REGION)
 # =========================
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
-app.include_router(videos_router, prefix="") #please go to my S3 bucket
+app.include_router(videos_router, prefix="/v2") #please go to my S3 bucket
 
 app.add_middleware(
     CORSMiddleware,
