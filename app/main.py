@@ -1,12 +1,11 @@
-# app/main.py
 import os
-import io
 import json
-import uuid
 import time
+import uuid
 import shutil
 import tempfile
 import subprocess
+import logging
 from typing import Optional, List
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Body, Header, Query
@@ -16,13 +15,15 @@ from fastapi.staticfiles import StaticFiles
 
 from jose import jwt, JWTError
 import boto3
-from botocore.exceptions import ClientError
+from botocore.config import Config as BotoConfig
+from botocore.exceptions import ClientError, NoCredentialsError, ProfileNotFound
+from dotenv import load_dotenv
 
-# =========================
-# Config / Environment
-# =========================
+# Load .env in local/dev (harmless in prod)
+load_dotenv()
+
 APP_NAME = "Video Splitter API"
-APP_VERSION = "2.0.0"  # bumped for S3/DDB
+APP_VERSION = "2.1.0"
 SECRET = os.getenv("JWT_SECRET", "dev-only-change-me")
 ALGO = "HS256"
 
@@ -30,21 +31,64 @@ AWS_REGION = os.getenv("AWS_REGION", "ap-southeast-2")
 S3_BUCKET = os.getenv("S3_BUCKET", "")
 DDB_VIDEOS_TABLE = os.getenv("DDB_VIDEOS_TABLE", "")
 DDB_JOBS_TABLE = os.getenv("DDB_JOBS_TABLE", "")
-# CAB432 DynamoDB partition key requirement:
-QUT_USERNAME = os.getenv("QUT_USERNAME", "n10254854@qut.edu.au")
+QUT_USERNAME = os.getenv("QUT_USERNAME", "n10254854@qut.edu.au")  # goes into JWT
 
-if not (S3_BUCKET and DDB_VIDEOS_TABLE and DDB_JOBS_TABLE):
-    raise RuntimeError("Missing required env vars: S3_BUCKET, DDB_VIDEOS_TABLE, DDB_JOBS_TABLE")
+# Validate required env
+_missing = [k for k, v in {
+    "S3_BUCKET": S3_BUCKET,
+    "DDB_VIDEOS_TABLE": DDB_VIDEOS_TABLE,
+    "DDB_JOBS_TABLE": DDB_JOBS_TABLE,
+}.items() if not v]
+if _missing:
+    raise RuntimeError(f"Missing required env vars: {', '.join(_missing)}")
 
-# Hard-coded users (A1 style)
+# Users (A1 style)
 USERS = {
     "admin": {"password": "admin123", "role": "admin"},
-    "user": {"password": "user123", "role": "user"},
+    "user":  {"password": "user123",  "role": "user"},
 }
 
-# AWS clients
-s3 = boto3.client("s3", region_name=AWS_REGION)
-ddb = boto3.client("dynamodb", region_name=AWS_REGION)
+# Global boto config (retries, timeouts)
+BOTO_CFG = BotoConfig(
+    region_name=AWS_REGION,
+    retries={"max_attempts": 5, "mode": "standard"},
+    connect_timeout=5,
+    read_timeout=60,
+)
+
+def _new_session():
+    """
+    Create a boto3 Session in a robust way:
+    - If AWS_PROFILE is set, try that.
+    - Else, default Session (works with EC2 role or env/static creds).
+    """
+    profile = os.getenv("AWS_PROFILE")
+    try:
+        if profile:
+            return boto3.Session(profile_name=profile, region_name=AWS_REGION)
+        return boto3.Session(region_name=AWS_REGION)
+    except ProfileNotFound:
+        # Fall back to default if profile is not configured
+        return boto3.Session(region_name=AWS_REGION)
+
+def aws_clients():
+    """Return fresh clients using the resilient session + config."""
+    sess = _new_session()
+    return (
+        sess.client("s3", config=BOTO_CFG),
+        sess.client("dynamodb", config=BOTO_CFG),
+        sess.client("sts", config=BOTO_CFG),
+    )
+
+# For lightweight /healthz info
+def aws_identity_summary() -> str:
+    try:
+        _, _, sts = aws_clients()
+        ident = sts.get_caller_identity()
+        return f"{ident.get('Account')}:{ident.get('Arn')}"
+    except Exception as e:
+        return f"unavailable: {e!s}"
+
 
 # =========================
 # App / CORS / Static
@@ -123,47 +167,61 @@ def ffmpeg_split(in_path: str, out_dir: str, parts: int, mode: str) -> List[str]
 
     return sorted([os.path.join(out_dir,f) for f in os.listdir(out_dir) if f.endswith(".mp4")])
 
-# =========================
-# S3 helpers
-# =========================
+# ---------- S3 helpers ----------
 def s3_key_input(email: str, video_id: str, filename: str) -> str:
-    return f"{email}/{video_id}/input/{filename}"
+    # very simple filename guard
+    safe = os.path.basename(filename)
+    return f"{email}/{video_id}/input/{safe}"
 
 def s3_prefix_segments(email: str, video_id: str, mode: str) -> str:
     return f"{email}/{video_id}/segments_{'fast' if mode=='fast' else 'heavy'}/"
 
 def s3_upload_file(local_path: str, key: str, content_type: str = "application/octet-stream"):
+    s3, _, _ = aws_clients()
     extra = {"ContentType": content_type} if content_type else {}
-    s3.upload_file(local_path, S3_BUCKET, key, ExtraArgs=extra)
+    try:
+        s3.upload_file(local_path, S3_BUCKET, key, ExtraArgs=extra)
+    except NoCredentialsError:
+        raise HTTPException(500, "AWS credentials not available")
+    except ClientError as e:
+        # Surface "expired/invalid token" clearly
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in {"ExpiredToken", "InvalidToken", "UnrecognizedClientException"}:
+            raise HTTPException(500, f"AWS auth error: {code}")
+        raise
 
 def s3_download_file(key: str, local_path: str):
+    s3, _, _ = aws_clients()
     os.makedirs(os.path.dirname(local_path), exist_ok=True)
-    s3.download_file(S3_BUCKET, key, local_path)
+    try:
+        s3.download_file(S3_BUCKET, key, local_path)
+    except NoCredentialsError:
+        raise HTTPException(500, "AWS credentials not available")
 
 def s3_presign_get(key: str, expires: int = 3600) -> str:
-    return s3.generate_presigned_url(
-        "get_object", Params={"Bucket": S3_BUCKET, "Key": key}, ExpiresIn=expires
-    )
+    s3, _, _ = aws_clients()
+    try:
+        return s3.generate_presigned_url(
+            "get_object", Params={"Bucket": S3_BUCKET, "Key": key}, ExpiresIn=expires
+        )
+    except NoCredentialsError:
+        raise HTTPException(500, "AWS credentials not available")
 
 def s3_list(prefix: str) -> List[str]:
+    s3, _, _ = aws_clients()
     keys = []
-    cont = None
-    while True:
-        kw = {"Bucket": S3_BUCKET, "Prefix": prefix}
-        if cont: kw["ContinuationToken"] = cont
-        resp = s3.list_objects_v2(**kw)
-        for it in resp.get("Contents", []) or []:
-            keys.append(it["Key"])
-        if resp.get("IsTruncated"):
-            cont = resp.get("NextContinuationToken")
-        else:
-            break
-    return keys
+    paginator = s3.get_paginator("list_objects_v2")
+    try:
+        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
+            for it in page.get("Contents", []) or []:
+                keys.append(it["Key"])
+        return keys
+    except NoCredentialsError:
+        raise HTTPException(500, "AWS credentials not available")
 
-# =========================
-# DynamoDB helpers
-# =========================
+# ---------- DynamoDB helpers ----------
 def ddb_put_video(email: str, video_id: str, filename: str, duration: float):
+    _, ddb, _ = aws_clients()
     ddb.put_item(
         TableName=DDB_VIDEOS_TABLE,
         Item={
@@ -176,6 +234,7 @@ def ddb_put_video(email: str, video_id: str, filename: str, duration: float):
     )
 
 def ddb_get_video(email: str, video_id: str):
+    _, ddb, _ = aws_clients()
     resp = ddb.get_item(
         TableName=DDB_VIDEOS_TABLE,
         Key={"qut-username":{"S": email}, "video_id":{"S": video_id}}
@@ -183,6 +242,7 @@ def ddb_get_video(email: str, video_id: str):
     return resp.get("Item")
 
 def ddb_list_videos(email: str, limit: int = 50, last_key: Optional[dict] = None):
+    _, ddb, _ = aws_clients()
     kwargs = {
         "TableName": DDB_VIDEOS_TABLE,
         "KeyConditionExpression": "#pk = :u",
@@ -196,6 +256,7 @@ def ddb_list_videos(email: str, limit: int = 50, last_key: Optional[dict] = None
     return ddb.query(**kwargs)
 
 def ddb_put_job(email: str, job_id: str, video_id: str, mode: str, parts: int, status: str):
+    _, ddb, _ = aws_clients()
     ddb.put_item(
         TableName=DDB_JOBS_TABLE,
         Item={
@@ -210,6 +271,7 @@ def ddb_put_job(email: str, job_id: str, video_id: str, mode: str, parts: int, s
     )
 
 def ddb_update_job_status(email: str, job_id: str, status: str, parts_done: Optional[int]=None):
+    _, ddb, _ = aws_clients()
     expr = "SET #s = :s, updated_at = :t"
     names = {"#s": "status"}
     vals = {":s":{"S": status}, ":t":{"N": str(int(time.time()))}}
@@ -225,6 +287,7 @@ def ddb_update_job_status(email: str, job_id: str, status: str, parts_done: Opti
     )
 
 def ddb_get_job(email: str, job_id: str):
+    _, ddb, _ = aws_clients()
     resp = ddb.get_item(
         TableName=DDB_JOBS_TABLE,
         Key={"qut-username":{"S": email}, "job_id":{"S": job_id}}
