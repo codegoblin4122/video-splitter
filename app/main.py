@@ -9,9 +9,6 @@ import tempfile
 import subprocess
 from typing import Optional, List
 
-from app.routes_videos import router as videos_router #please give me marks
-
-
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Body, Header, Query
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -34,7 +31,7 @@ S3_BUCKET = os.getenv("S3_BUCKET", "")
 DDB_VIDEOS_TABLE = os.getenv("DDB_VIDEOS_TABLE", "")
 DDB_JOBS_TABLE = os.getenv("DDB_JOBS_TABLE", "")
 # CAB432 DynamoDB partition key requirement:
-QUT_USERNAME = os.getenv("QUT_USERNAME", "please_set_qut_username@example.com")
+QUT_USERNAME = os.getenv("QUT_USERNAME", "n10254854@qut.edu.au")
 
 if not (S3_BUCKET and DDB_VIDEOS_TABLE and DDB_JOBS_TABLE):
     raise RuntimeError("Missing required env vars: S3_BUCKET, DDB_VIDEOS_TABLE, DDB_JOBS_TABLE")
@@ -53,9 +50,6 @@ ddb = boto3.client("dynamodb", region_name=AWS_REGION)
 # App / CORS / Static
 # =========================
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
-
-app.include_router(videos_router, prefix="/v2") #please go to my S3 bucket
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -276,8 +270,8 @@ async def upload_video(file: UploadFile = File(...), authorization: str = Header
         return {"video_id": video_id, "filename": os.path.basename(local_path), "duration": duration}
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
-
 @app.get("/videos")
+
 def list_videos(
     authorization: str = Header(default=""),
     page_size: int = Query(25, ge=1, le=100),
@@ -287,16 +281,41 @@ def list_videos(
     lek = json.loads(last_evaluated_key) if last_evaluated_key else None
     resp = ddb_list_videos(user["email"], limit=page_size, last_key=lek)
     items = resp.get("Items", [])
+
     out = []
     for it in items:
+        video_id = it.get("video_id", {}).get("S")
+        if not video_id:
+            continue  # skip malformed rows
+
+        filename = it.get("filename", {}).get("S", "video")
+
+        # duration fallback
+        try:
+            duration = float(it.get("duration", {}).get("N", 0))
+        except Exception:
+            duration = 0.0
+
+        # created_at fallback
+        try:
+            created_at = int(it.get("created_at", {}).get("N", 0))
+        except Exception:
+            created_at = 0
+
         out.append({
-            "video_id": it["video_id"]["S"],
-            "filename": it["filename"]["S"],
-            "duration": float(it["duration"]["N"]),
-            "created_at": int(it["created_at"]["N"]),
+            "video_id": video_id,
+            "filename": filename,
+            "duration": duration,
+            "created_at": created_at,
         })
+
     next_key = resp.get("LastEvaluatedKey")
-    return {"total": len(out), "videos": out, "next_cursor": json.dumps(next_key) if next_key else None}
+    return {
+        "total": len(out),
+        "videos": out,
+        "next_cursor": json.dumps(next_key) if next_key else None,
+    }
+
 
 @app.get("/videos/{video_id}")
 def get_video(video_id: str, authorization: str = Header(default="")):
