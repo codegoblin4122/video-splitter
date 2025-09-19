@@ -1,0 +1,50 @@
+
+1) Clean up any conflicting AWS env vars
+# See what’s set
+gci env:AWS_* | ft Name,Value -Auto
+
+# Remove anything that supplies static creds or a wrong profile
+Remove-Item Env:AWS_ACCESS_KEY_ID      -ErrorAction SilentlyContinue
+Remove-Item Env:AWS_SECRET_ACCESS_KEY  -ErrorAction SilentlyContinue
+Remove-Item Env:AWS_SESSION_TOKEN      -ErrorAction SilentlyContinue
+Remove-Item Env:AWS_PROFILE            -ErrorAction SilentlyContinue
+
+# Let boto3 read ~/.aws/config (needed for SSO profiles)
+$Env:AWS_SDK_LOAD_CONFIG = "1"
+
+2) Make sure your default SSO profile exists & is logged in
+
+Your earlier wizard saved creds to the default profile.
+
+aws configure list-profiles          # should include 'default'
+aws sso login --profile default      # opens browser; finish the login
+
+
+If you don’t see default, run the SSO wizard once and name the profile default:
+
+aws configure sso
+# choose your start URL, region ap-southeast-2, account 901444280953, role CAB432-STUDENT
+# when asked Profile name: default
+aws sso login --profile default
+
+3) Set region + app env vars
+$Env:AWS_PROFILE        = "default"
+$Env:AWS_REGION         = "ap-southeast-2"
+
+$Env:S3_BUCKET          = "n10254854-video-splitter"
+$Env:DDB_VIDEOS_TABLE   = "n10254854-videos"
+$Env:DDB_JOBS_TABLE     = "n10254854-jobs"
+$Env:JWT_SECRET         = "dev-secret"
+$Env:QUT_USERNAME       = "n10254854@qut.edu.au"
+
+4) Quick sanity checks (must succeed)
+aws sts get-caller-identity
+aws s3 ls s3://n10254854-video-splitter
+aws dynamodb describe-table --table-name n10254854-videos
+
+
+If any of those fail, your creds aren’t good yet—repeat step 2.
+(Also ensure your system clock is correct; if wildly off, SigV4 fails. You can resync time with w32tm /resync.)
+
+5) Run your app
+python -m uvicorn app.main:app --host 0.0.0.0 --port 8000

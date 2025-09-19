@@ -175,7 +175,7 @@
         const data = await res.json();
         vidCount.textContent = `${data.total||0} video(s)`;
         videosList.innerHTML = '';
-        (data.videos||[]).forEach(v => {
+        (data.items||data.videos||[]).forEach(v => {
           const el = document.createElement('div'); el.className='list-item';
           el.innerHTML = `<b>${v.filename||'video'}</b><br>
                           id: ${v.video_id}, duration: ${v.duration}s<br>
@@ -193,17 +193,42 @@
     const videoDurationIn = document.getElementById('videoDuration');
     const jobStatus = document.getElementById('jobStatus');
 
-    async function openVideo(id){
-      try{
-        const res = await fetch(apiBase()+`/videos/${id}`,{ headers: authHeaders() });
-        if(!res.ok) throw new Error('Failed to fetch video');
-        const v = await res.json();
-        videoPanel.style.display='block';
-        videoIdIn.value = v.video_id; videoFilenameIn.value = v.filename; videoDurationIn.value = v.duration;
-        await listSegments();
-      }catch(e){ alert(e.message); }
-    }
+async function openVideo(id){
+  // call detail API
+  const res = await fetch(apiBase()+`/videos/${id}`, { headers: authHeaders() });
+  if (!res.ok) {
+    const msg = await res.text();
+    alert(`Failed to open video ${id}:\n${msg}`);
+    return;
+  }
+  const v = await res.json();
 
+  // show the panel
+  const panel = document.getElementById('videoPanel');
+  panel.style.display = 'block';
+
+  // fill in fields (they are <input>, so use .value)
+  document.getElementById('videoId').value       = v.video_id || id;
+  document.getElementById('videoFilename').value = v.filename || '';
+  document.getElementById('videoDuration').value = (v.duration ?? '');
+
+  // set the player source
+  const player = document.getElementById('videoPlayer');
+  player.removeAttribute('src');
+  player.load();
+  if (v.source_url) {
+    // API returns a relative path like "/files/<encoded s3 key>"
+    player.src = apiBase() + v.source_url;
+    player.load();
+    // optional:
+    // player.play().catch(()=>{});
+  }
+
+  // optionally list segments for this video
+  if (typeof listSegments === 'function') {
+    await listSegments();
+  }
+}
     // ---------- Split ----------
     document.getElementById('splitAsyncBtn').onclick = async () => {
       const id = videoIdIn.value; if(!id) return;
