@@ -8,6 +8,10 @@ from .aws import (
     ddb_put_job, ddb_update_job_status, ddb_get_job
 )
 from .auth import require_user  # your existing JWT dependency
+from dotenv import load_dotenv
+
+# Load .env as soon as this module is imported
+load_dotenv()
 
 router = APIRouter()
 

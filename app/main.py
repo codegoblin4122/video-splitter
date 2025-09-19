@@ -21,6 +21,9 @@ from jose import jwt, JWTError
 import boto3
 from botocore.exceptions import ClientError
 
+from dotenv import load_dotenv
+load_dotenv() # load .env for local dev 
+
 # =========================
 # Config / Environment
 # =========================
