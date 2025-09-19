@@ -1,28 +1,33 @@
 # app/auth.py
-import os
 from fastapi import Header, HTTPException
 from jose import jwt, JWTError
+from .config import JWT_SECRET
 from dotenv import load_dotenv
 
 load_dotenv()  # read .env for local dev
 
-ALGO = "HS256"
-SECRET = os.getenv("JWT_SECRET", "dev-only-change-me")
+# Minimal dependency used by routes_videos.py
+def require_user(authorization: str | None = Header(default=None)):
+    """
+    Accepts either:
+    - Bearer <JWT> signed with HS256 using JWT_SECRET, containing 'email' or 'sub'
+    - No header at all (dev mode): returns a default user for testing
+    """
+    if not authorization:
+        # Dev fallback so you can test without tokens
+        return {"email": "devuser@example.com"}
 
-def _decode_bearer(authorization: str) -> dict:
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(401, "Missing or invalid Authorization header")
-    token = authorization.split(" ", 1)[1]
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        raise HTTPException(status_code=401, detail="Invalid Authorization header")
+
     try:
-        return jwt.decode(token, SECRET, algorithms=[ALGO])
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
     except JWTError:
-        raise HTTPException(401, "Invalid or expired token")
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
 
-# Used by routes_videos.py (FastAPI dependency or manual call)
-def require_user(authorization: str = Header(default="")) -> dict:
-    claims = _decode_bearer(authorization)
-    return {
-        "username": claims.get("sub"),
-        "role": claims.get("role"),
-        "email": claims.get("email"),
-    }
+    email = payload.get("email") or payload.get("sub")
+    if not email:
+        raise HTTPException(status_code=401, detail="Token missing email/sub")
+
+    return {"email": email}

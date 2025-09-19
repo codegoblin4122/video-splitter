@@ -1,6 +1,26 @@
-.env
-.venv/
+﻿# Python
 __pycache__/
-data/
-.vscode/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db
 .idea/
+.vscode/
+
+# Local data & secrets
+.env
+.env.*
+.env.txt
+data/
+tmp/
+upload_*/
+
+# Build artifacts
+dist/
+build/
