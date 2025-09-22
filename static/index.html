@@ -193,43 +193,37 @@
     const videoDurationIn = document.getElementById('videoDuration');
     const jobStatus = document.getElementById('jobStatus');
 
-async function openVideo(id){
-  // call detail API
-  const res = await fetch(apiBase()+`/videos/${id}`, { headers: authHeaders() });
-  if (!res.ok) {
-    const msg = await res.text();
-    alert(`Failed to open video ${id}:\n${msg}`);
-    return;
-  }
-  const v = await res.json();
+    async function openVideo(id){
+      const res = await fetch(apiBase()+`/videos/${id}`, { headers: authHeaders() });
+      if (!res.ok) {
+        const msg = await res.text();
+        alert(`Failed to open video ${id}:\n${msg}`);
+        return;
+      }
+      const v = await res.json();
 
-  // show the panel
-  const panel = document.getElementById('videoPanel');
-  panel.style.display = 'block';
+      videoPanel.style.display = 'block';
+      videoIdIn.value       = v.video_id || id;
+      videoFilenameIn.value = v.filename || '';
+      videoDurationIn.value = (v.duration ?? '');
 
-  // fill in fields (they are <input>, so use .value)
-  document.getElementById('videoId').value       = v.video_id || id;
-  document.getElementById('videoFilename').value = v.filename || '';
-  document.getElementById('videoDuration').value = (v.duration ?? '');
+      const player = document.getElementById('videoPlayer');
+      player.removeAttribute('src');
+      player.load();
+      if (v.source_url) {
+        player.src = apiBase() + v.source_url;
+        player.load();
+      }
 
-  // set the player source
-  const player = document.getElementById('videoPlayer');
-  player.removeAttribute('src');
-  player.load();
-  if (v.source_url) {
-    // API returns a relative path like "/files/<encoded s3 key>"
-    player.src = apiBase() + v.source_url;
-    player.load();
-    // optional:
-    // player.play().catch(()=>{});
-  }
+      if (typeof listSegments === 'function') {
+        await listSegments();
+      }
+    }
 
-  // optionally list segments for this video
-  if (typeof listSegments === 'function') {
-    await listSegments();
-  }
-}
     // ---------- Split ----------
+    // save last job id so the Poll button knows which job to ask for
+    window._lastJobId = '';
+
     document.getElementById('splitAsyncBtn').onclick = async () => {
       const id = videoIdIn.value; if(!id) return;
       const mode = document.getElementById('splitMode').value; 
@@ -240,8 +234,10 @@ async function openVideo(id){
           method:'POST', headers: authHeaders()
         });
         if(!res.ok) throw new Error('Split async failed');
+        const data = await res.json();
+        window._lastJobId = data.job_id;                 // <-- save the job id
         jobStatus.textContent = 'Queued';
-        pollJob(id,true);
+        pollJob(window._lastJobId,true);                 // <-- poll by job id
       }catch(e){ jobStatus.textContent = e.message; }
     };
 
@@ -261,23 +257,32 @@ async function openVideo(id){
       }catch(e){ jobStatus.textContent = e.message; }
     };
 
-    document.getElementById('pollJobBtn').onclick = ()=>{ const id = videoIdIn.value; if(id) pollJob(id,false); };
+    // Poll button: uses stored job id
+    document.getElementById('pollJobBtn').onclick = () => {
+      if (window._lastJobId) pollJob(window._lastJobId,false);
+      else alert('No job id yet — run Split (async) first.');
+    };
 
-    async function pollJob(id, auto){
+    // Poll by job id (not video id)
+    async function pollJob(jobId, auto){
       try{
-        const res = await fetch(apiBase()+`/jobs/${id}`,{ headers: authHeaders() });
+        const res = await fetch(apiBase()+`/jobs/${jobId}`,{ headers: authHeaders() });
         if(!res.ok) throw new Error('Job not found');
         const j = await res.json();
         jobStatus.textContent = `Status: ${j.status}` + (j.parts?` • parts: ${j.parts}`:'');
         if(j.status==='done'){ await listSegments(); return; }
         if(j.status==='error'){ return; }
-        if(auto){ setTimeout(()=>pollJob(id,true),2500); }
+        if(auto){ setTimeout(()=>pollJob(jobId,true),2500); }
       }catch(e){ jobStatus.textContent = e.message; }
     }
 
     // ---------- Segments ----------
     const segmentsGrid = document.getElementById('segmentsGrid');
     document.getElementById('loadSegments').onclick = listSegments;
+
+    function absOrApi(url){
+      return /^https?:\/\//i.test(url) ? url : (apiBase()+url);
+    }
 
     async function listSegments(){
       const id = videoIdIn.value; if(!id) return;
@@ -295,17 +300,38 @@ async function openVideo(id){
           group.segments.forEach((url, idx) => {
             const div = document.createElement('div'); div.className='list-item';
             const fname = `part_${String(idx).padStart(2,'0')}.mp4`;
-            div.innerHTML = `${fname} <button>Download</button>`;
-            div.querySelector('button').onclick = () => downloadWithAuth(url, fname);
+            const src = absOrApi(url);
+
+            // inline preview (keeps current style; just an element in the item)
+            const vid = document.createElement('video');
+            vid.src = src;
+            vid.controls = true;
+            vid.width = 320;
+
+            const btn = document.createElement('button');
+            btn.textContent = 'Download';
+            btn.onclick = () => downloadWithAuth(url, fname);
+
+            const label = document.createElement('div');
+            label.textContent = fname;
+
+            div.appendChild(label);
+            div.appendChild(vid);
+            div.appendChild(document.createElement('br'));
+            div.appendChild(btn);
             segmentsGrid.appendChild(div);
           });
         });
       }catch(e){ segmentsGrid.textContent = e.message; }
     }
 
+    // Use presigned S3 URLs directly (no apiBase, no auth header)
     async function downloadWithAuth(url, filename){
       try{
-        const res = await fetch(apiBase()+url, { headers: authHeaders() });
+        const isAbs = /^https?:\/\//i.test(url);
+        const res = await fetch(isAbs ? url : (apiBase()+url), {
+          headers: isAbs ? {} : authHeaders()
+        });
         if(!res.ok) throw new Error('Download failed');
         const blob = await res.blob();
         const a = document.createElement('a');

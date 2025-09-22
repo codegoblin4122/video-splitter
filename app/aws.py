@@ -1,15 +1,23 @@
 # app/aws.py
-import os
 import time
-import boto3
+import logging, boto3
 from botocore.exceptions import ClientError
 from .config import AWS_REGION, S3_BUCKET, DDB_VIDEOS_TABLE, DDB_JOBS_TABLE
 
+logger = logging.getLogger("video-splitter")
+
 # One session/clients
 _session = boto3.session.Session(region_name=AWS_REGION)
-s3 = _session.client("s3")
+s3  = _session.client("s3")
 ddb = _session.client("dynamodb")
 
+# very very helpful on-start log so you SEE the values being used
+logger.info(
+    f"AWS_REGION={AWS_REGION} "
+    f"S3_BUCKET={S3_BUCKET} "
+    f"DDB_VIDEOS_TABLE={DDB_VIDEOS_TABLE} "
+    f"DDB_JOBS_TABLE={DDB_JOBS_TABLE}"
+)
 # ---------- S3 ----------
 def s3_upload_stream(fileobj, key: str, content_type="application/octet-stream"):
     # Stream straight to S3
@@ -122,7 +130,6 @@ def ddb_get_video(user_email: str, video_id: str):
 
     return None
 
-
 def ddb_append_outputs(user_email: str, video_id: str, mode: str, parts: int, segment_keys: list[str]):
     """
     Appends one outputs-group to the video item:
@@ -147,41 +154,102 @@ def ddb_append_outputs(user_email: str, video_id: str, mode: str, parts: int, se
         ReturnValues="NONE"
     )
 
+def s3_list_keys(prefix: str) -> list[str]:
+    """
+    Return all object keys under the given prefix.
+    """
+    keys = []
+    kwargs = {"Bucket": S3_BUCKET, "Prefix": prefix, "MaxKeys": 1000}
+    while True:
+        resp = s3.list_objects_v2(**kwargs)
+        for obj in resp.get("Contents", []) or []:
+            keys.append(obj["Key"])
+        if resp.get("IsTruncated"):
+            kwargs["ContinuationToken"] = resp["NextContinuationToken"]
+        else:
+            break
+    return keys
+
 # ---------- DynamoDB: Jobs ----------
-def ddb_put_job(user_email: str, job_id: str, video_id: str, mode: str, parts: int, status: str):
-    ddb.put_item(
+def ddb_put_job(user_email, job_id, video_id, mode, parts, status="queued"):
+    logger.debug(f"ddb_put_job(table={DDB_JOBS_TABLE}): email={user_email} job_id={job_id} video_id={video_id} mode={mode} parts={parts} status={status}")
+    return ddb.put_item(
         TableName=DDB_JOBS_TABLE,
         Item={
-            "qut-username":{"S":user_email},
-            "job_id":{"S":job_id},
-            "video_id":{"S":video_id},
-            "mode":{"S":mode},
-            "parts":{"N":str(parts)},
-            "status":{"S":status},
-            "updated_at":{"N":str(int(time.time()))}
+            "qut-username": {"S": user_email},
+            "job_id": {"S": job_id},
+            "video_id": {"S": video_id},
+            "mode": {"S": mode},
+            "parts": {"N": str(parts)},
+            "status": {"S": status}
         }
     )
 
-def ddb_update_job_status(user_email: str, job_id: str, status: str,
-                          parts_done: int | None = None, error: str | None = None):
+def ddb_update_job_status(
+    user_email: str,
+    job_id: str,
+    status: str,
+    parts: int | None = None,
+    parts_done: int | None = None,   # legacy alias
+    error: str | None = None
+):
+    # --- update the job item as you already do ---
     expr = "SET #s = :s, updated_at = :t"
     names = {"#s": "status"}
     values = {":s": {"S": status}, ":t": {"N": str(int(time.time()))}}
-    if parts_done is not None:
-        expr += ", parts_done = :pd"
-        values[":pd"] = {"N": str(parts_done)}
+
+    # normalize aliases
+    _parts = parts if parts is not None else parts_done
+
+    if _parts is not None:
+        expr += ", parts = :p"
+        values[":p"] = {"N": str(_parts)}
     if error is not None:
-        # 'error' is reserved → use a name placeholder
         expr += ", #err = :e"
         names["#err"] = "error"
         values[":e"] = {"S": error[:500]}
+
     ddb.update_item(
         TableName=DDB_JOBS_TABLE,
-        Key={"qut-username":{"S":user_email}, "job_id":{"S":job_id}},
+        Key={"qut-username": {"S": user_email}, "job_id": {"S": job_id}},
         UpdateExpression=expr,
         ExpressionAttributeNames=names,
         ExpressionAttributeValues=values,
     )
+
+    # --- when a job finishes, append outputs onto the video item ---
+    if status == "done":
+        # get the full job so we know video_id/mode/parts
+        job = ddb_get_job(user_email, job_id)
+        if not job:
+            logger.warning(f"ddb_update_job_status: job not found to finalize outputs (job_id={job_id})")
+            return
+
+        video_id = job["video_id"]["S"]
+        mode = job.get("mode", {}).get("S", "unknown")
+        job_parts = _parts if _parts is not None else int(job.get("parts", {}).get("N", "0") or "0")
+
+        # Your S3 layout appears to be: videos/{email}/{video_id}/{mode}-{parts}/part_XXX.mp4
+        folder = f"{mode}-{job_parts}" if job_parts else mode
+        prefix = f"videos/{user_email}/{video_id}/{folder}/"
+
+        segment_keys = sorted(k for k in s3_list_keys(prefix) if k.lower().endswith(".mp4"))
+        if not segment_keys:
+            logger.warning(f"Finalize outputs: no segment keys found under {prefix}")
+            return
+
+        try:
+            ddb_append_outputs(
+                user_email=user_email,
+                video_id=video_id,
+                mode=folder,           # e.g., "heavy-2"
+                parts=job_parts,
+                segment_keys=segment_keys,
+            )
+            logger.info(f"Appended {len(segment_keys)} segment(s) to video {video_id} outputs ({folder}).")
+        except Exception as e:
+            logger.exception(f"Failed to append outputs for video {video_id}: {e}")
+
 
 def ddb_get_job(user_email: str, job_id: str):
     resp = ddb.get_item(
@@ -189,3 +257,28 @@ def ddb_get_job(user_email: str, job_id: str):
         Key={"qut-username":{"S":user_email}, "job_id":{"S":job_id}}
     )
     return resp.get("Item")
+
+def ddb_update_job_error(user_email, job_id, error_message):
+    logger.debug(f"ddb_update_job_error(table={DDB_JOBS_TABLE}): {job_id} -> error '{error_message}'")
+    return ddb.update_item(
+        TableName=DDB_JOBS_TABLE,
+        Key={"qut-username":{"S":user_email}, "job_id":{"S":job_id}},
+        UpdateExpression="SET #s = :s, error_message = :m",
+        ExpressionAttributeNames={"#s":"status"},
+        ExpressionAttributeValues={":s":{"S":"error"}, ":m":{"S":error_message[:1000]}}
+    )
+
+def s3_download_to_path(s3_key: str, dest_path: str):
+    logger.debug(f"s3_download_to_path: s3://{S3_BUCKET}/{s3_key} -> {dest_path}")
+    s3.download_file(S3_BUCKET, s3_key, dest_path)
+
+def s3_upload_file(local_path: str, s3_key: str):
+    logger.debug(f"s3_upload_file: {local_path} -> s3://{S3_BUCKET}/{s3_key}")
+    s3.upload_file(local_path, S3_BUCKET, s3_key)
+
+def make_presigned_url(s3_key: str, expires=3600):
+    return s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": S3_BUCKET, "Key": s3_key},
+        ExpiresIn=expires
+    )

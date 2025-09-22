@@ -4,19 +4,20 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 import logging, traceback
 
-from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Query, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Query, BackgroundTasks, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse, StreamingResponse
 
 import jwt
-from .aws import s3_key_exists
+from .aws import s3_key_exists, ddb_update_job_error  
 
 from .config import AWS_REGION, S3_BUCKET, DDB_VIDEOS_TABLE, DDB_JOBS_TABLE, QUT_USERNAME
 from .aws import (
     s3_upload_stream, s3_get_to_file, s3_put_file, s3_presign_get,
     ddb_put_video, ddb_list_videos, ddb_get_video,
-    ddb_put_job, ddb_update_job_status, ddb_get_job, ddb_append_outputs
+    ddb_put_job, ddb_update_job_status, ddb_get_job, ddb_append_outputs,
+    s3_download_to_path, s3_upload_file, s3_key_exists
 )
 
 # -----------------------------------------------------------------------------
@@ -100,6 +101,40 @@ def login(body: Dict[str, str]):
 # -----------------------------------------------------------------------------
 # Upload video (streams to S3, no disk writes)
 # -----------------------------------------------------------------------------
+
+def _ddb_unbox(av):
+    # Unbox a DynamoDB AttributeValue dict into a Python value
+    if not isinstance(av, dict) or len(av) != 1:
+        return av
+    (t, v), = av.items()
+    if t == "S": return v
+    if t == "N":
+        try: 
+            return int(v)
+        except ValueError:
+            try:
+                return float(v)
+            except ValueError:
+                return v
+    if t == "BOOL": return bool(v)
+    if t == "NULL": return None
+    if t == "L": return [_ddb_unbox(x) for x in v]
+    if t == "M": return {k: _ddb_unbox(x) for k, x in v.items()}
+    return v
+
+def _video_s3_key_from_item(it):
+    # Accepts a raw DynamoDB Item (AttributeValue maps)
+    it_u = {k: _ddb_unbox(v) for k, v in it.items()}
+    key = it_u.get("s3_key")
+    if not key:
+        # Compute the legacy/default key from filename
+        email = it_u.get("qut-username")
+        vid   = it_u.get("video_id")
+        fname = it_u.get("filename", "video.mp4")
+        from .main import safe_filename  # or move safe_filename above
+        key = f"videos/{email}/{vid}/{safe_filename(fname)}"
+    return key
+
 @app.post("/videos/upload")
 def upload_video(
     authorization: str = Header(default=""),
@@ -427,54 +462,96 @@ def split_video_locally_and_upload(s3_key_in: str, mode: str, parts: int, user_e
 @app.post("/videos/{id}/split_async")
 def split_async(
     id: str,
-    mode: str = Query("heavy", pattern="^(heavy|fast)$"),
-    parts: int = Query(10, ge=2, le=100),
+    parts: int = 10,
+    mode: str = "fast",
     authorization: str = Header(default=""),
-    background_tasks: BackgroundTasks = None,
+    background: BackgroundTasks = None,
 ):
     user = current_user(authorization)
-    it = ddb_get_video(user["email"], id)
-    if not it:
-        raise HTTPException(status_code=404, detail="Video not found")
+    job_id = str(uuid.uuid4())
 
-    # Use the persisted/resolved S3 key for splitting
-    s3_key = resolve_video_s3_key(user["email"], id, it)
+    logger.info(f"split_async requested: video_id={id} parts={parts} mode={mode} user={user['email']}")
 
-    job_id = id  # simple; you can also make it f"{id}:{mode}:{parts}"
+    # record queued
     ddb_put_job(user["email"], job_id, id, mode, parts, status="queued")
 
-    def work():
-        try:
-            ddb_update_job_status(user["email"], job_id, "processing")
-            # helpful breadcrumb in logs
-            logging.info("Splitting key=%s mode=%s parts=%s", s3_key, mode, parts)
+    # kick background runner
+    if background is None:
+        raise HTTPException(status_code=500, detail="BackgroundTasks not available")
+    background.add_task(run_split_job, user["email"], job_id, id, parts, mode)
 
-            split_video_locally_and_upload(s3_key, mode, parts, user["email"], id)
-            ddb_update_job_status(user["email"], job_id, "done", parts_done=parts)
-        except Exception as e:
-            err = f"{e.__class__.__name__}: {e}\n{traceback.format_exc()}"
-            ddb_update_job_status(user["email"], job_id, "error", error=err)
-
-    background_tasks.add_task(work)
     return {"job_id": job_id, "status": "queued"}
 
-# Optional sync split (blocks request)
-@app.post("/videos/{id}/split")
-def split_sync(
-    id: str,
-    mode: str = Query("heavy", pattern="^(heavy|fast)$"),
-    parts: int = Query(10, ge=2, le=100),
-    authorization: str = Header(default="")
-):
-    user = current_user(authorization)
-    it = ddb_get_video(user["email"], id)
-    if not it:
-        raise HTTPException(status_code=404, detail="Video not found")
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logger = logging.getLogger("video-splitter")
 
-    s3_key = resolve_video_s3_key(user["email"], id, it)
-    split_video_locally_and_upload(s3_key, mode, parts, user["email"], id)
-    return {"ok": True, "parts": parts}
+def run_split_job(user_email: str, job_id: str, video_id: str, parts: int, mode: str):
+    logger.info(f"[JOB {job_id}] started for video={video_id}")
+    try:
+        ddb_update_job_status(user_email, job_id, status="running")
 
+        # 1) Load video row and resolve S3 key
+        v = ddb_get_video(user_email, video_id)
+        if not v:
+            raise RuntimeError(f"Video {video_id} not found in DDB")
+
+        s3_key = _video_s3_key_from_item(v)
+        logger.debug(f"[JOB {job_id}] using s3_key={s3_key}")
+
+         # 2) Verify object exists before downloading
+        if not s3_key_exists(s3_key):
+            raise RuntimeError(f"Source not found in S3: {s3_key}")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_path = os.path.join(tmpdir, "source.mp4")
+            s3_download_to_path(s3_key, src_path)
+
+            # duration (prefer DDB, else probe)
+            try:
+                duration = float(v.get("duration", {}).get("N", 0) or 0)
+            except Exception:
+                duration = 0.0
+            if duration <= 0:
+                out = subprocess.check_output(
+                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                     "-of", "default=nk=1:nw=1", src_path],
+                    stderr=subprocess.STDOUT
+                ).decode().strip()
+                duration = float(out or 0)
+            seg_len = max(1, int(duration // parts) or 1)
+            logger.debug(f"[JOB {job_id}] duration={duration}, seg_len={seg_len}s")
+
+            # codec args
+            codec_args = ["-c", "copy"] if mode == "fast" else ["-c:v", "libx264", "-c:a", "aac", "-crf", "23"]
+
+            pattern = os.path.join(tmpdir, "part_%03d.mp4")
+            cmd = ["ffmpeg", "-y", "-i", src_path, "-f", "segment",
+                   "-segment_time", str(seg_len), "-reset_timestamps", "1",
+                   *codec_args, pattern]
+            logger.debug(f"[JOB {job_id}] ffmpeg cmd: {' '.join(cmd)}")
+            out = subprocess.run(cmd, capture_output=True, text=True)
+            logger.debug(f"[JOB {job_id}] ffmpeg stdout:\n{out.stdout}")
+            logger.debug(f"[JOB {job_id}] ffmpeg stderr:\n{out.stderr}")
+            if out.returncode != 0:
+                raise RuntimeError(f"ffmpeg failed (code {out.returncode})")
+
+            # upload back
+            uploaded = []
+            for fname in sorted(os.listdir(tmpdir)):
+                if fname.startswith("part_") and fname.endswith(".mp4"):
+                    local = os.path.join(tmpdir, fname)
+                    dest_key = f"videos/{user_email}/{video_id}/{mode}-{parts}/{fname}"
+                    s3_upload_file(local, dest_key)
+                    uploaded.append(dest_key)
+
+            logger.info(f"[JOB {job_id}] uploaded {len(uploaded)} part(s)")
+
+        ddb_update_job_status(user_email, job_id, status="done", parts=len(uploaded))
+        logger.info(f"[JOB {job_id}] done")
+
+    except Exception as e:
+        logger.exception(f"[JOB {job_id}] failed")
+        ddb_update_job_error(user_email, job_id, error_message=str(e))
 
 # Job status (reads from DDB)
 @app.get("/jobs/{job_id}")
@@ -498,3 +575,8 @@ def job_status(job_id: str, authorization: str = Header(default="")):
 
     out = {k: unbox(v) for k, v in it.items()}
     return out
+# execution handler
+@app.exception_handler(Exception)
+async def all_exception_handler(request, exc):
+    logger.exception("Unhandled error")
+    return JSONResponse(status_code=500, content={"detail": str(exc)})
