@@ -24,3 +24,9 @@ upload_*/
 # Build artifacts
 dist/
 build/
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
