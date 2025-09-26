@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Cognito MFA (TOTP) Demo</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 32px auto; max-width: 680px; }
+    h1 { font-size: 22px; margin-bottom: 8px; }
+    form { display: grid; gap: 8px; margin: 12px 0; }
+    input[type="text"], input[type="password"] { padding: 8px; border: 1px solid #ccc; border-radius: 6px; }
+    button { padding: 10px 14px; border: 0; border-radius: 8px; cursor: pointer; background: #111827; color: white; }
+    button:disabled { opacity: .6; cursor: not-allowed; }
+    .card { border: 1px solid #e5e7eb; border-radius: 10px; padding: 14px; margin-top: 16px; }
+    .muted { color: #555; font-size: 13px; }
+    code { background: #f3f4f6; padding: 2px 6px; border-radius: 4px; }
+    img.qr { border: 1px solid #e5e7eb; border-radius: 8px; padding: 6px; }
+    details summary { cursor: pointer; }
+    .mono { word-break: break-all; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h1>Cognito MFA (TOTP)</h1>
+  <p class="muted">
+    Login → enroll TOTP → verify 6-digit → get tokens and call a protected API.
+    After you sign in here, open <a href="./index.html">index.html</a> to use the app UI.
+  </p>
+
+  <div class="card">
+    <form id="loginForm">
+      <input id="username" type="text" placeholder="username (email)" required />
+      <input id="password" type="password" placeholder="password" required />
+      <button id="loginBtn" type="submit">Sign in</button>
+      <div style="margin:12px 0; text-align:center; color:#666;">— or —</div>
+      <button id="googleBtn" class="btn">Continue with Google</button>
+    </form>
+    <div id="status" class="muted"></div>
+  </div>
+
+  <div id="enroll" class="card" style="display:none;">
+    <h3>Step 2 — Enrol TOTP</h3>
+    <img id="qr" class="qr" alt="TOTP QR" />
+    <p class="muted">Or add manually:</p>
+    <p id="otpauth" class="mono"></p>
+    <form id="verifySetupForm">
+      <input id="totpSetup" type="text" inputmode="numeric" placeholder="6-digit code" />
+      <button type="submit">Verify & Finish</button>
+    </form>
+  </div>
+
+  <div id="mfa" class="card" style="display:none;">
+    <h3>Enter MFA code</h3>
+    <form id="verifyLoginForm">
+      <input id="totpLogin" type="text" inputmode="numeric" placeholder="6-digit code" />
+      <button type="submit">Verify & Sign in</button>
+    </form>
+  </div>
+
+  <div id="authed" class="card" style="display:none;">
+    <h3>Signed in</h3>
+    <button id="callApiBtn">GET /videos (protected)</button>
+    <button id="logoutBtn" type="button">Sign out (Cognito)</button>
+    <details style="margin-top:10px;">
+      <summary>Show ID token</summary>
+      <p id="tokenOut" class="mono"></p>
+    </details>
+  </div>
+
+<script>
+  // ==== Same API base logic as index.html ====
+  const DEFAULT_API =
+    (location.origin.includes('localhost') || location.origin.includes('127.0.0.1'))
+      ? 'http://localhost:8000'
+      : location.origin;
+
+  function API_BASE() {
+    return (localStorage.getItem('apiBase') || DEFAULT_API).replace(/\/$/, '');
+  }
+
+  // POST helper
+  async function post(path, body) {
+    const res = await fetch(API_BASE() + path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body || {})
+    });
+    if (!res.ok) throw new Error(await res.text());
+    return res.json();
+  }
+
+  // State
+  let session = "";
+  let challenge = "";
+  let username = "";
+  let idToken = "";
+
+  const $ = sel => document.querySelector(sel);
+  const setStatus = (msg) => { $("#status").textContent = msg || ""; };
+  const show = (id, on) => { document.getElementById(id).style.display = on ? "" : "none"; };
+
+  // Login
+  $("#loginForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    setStatus("Signing in…");
+    show("enroll", false); show("mfa", false); show("authed", false);
+    session = ""; challenge = ""; idToken = ""; $("#tokenOut").textContent = "";
+
+    try {
+      username = $("#username").value.trim();
+      const password = $("#password").value;
+
+      const resp = await post("/auth/login", { username, password });
+
+      if (resp.id_token) {
+        idToken = resp.id_token;
+        localStorage.setItem('jwt', idToken);      // make available to index.html
+        $("#tokenOut").textContent = idToken;
+        show("authed", true);
+        setStatus("Signed in (no MFA required).");
+        return;
+      }
+
+      challenge = resp.challenge;
+      session = resp.session;
+
+      if (challenge === "MFA_SETUP") {
+        setStatus("MFA setup required. Generating QR…");
+        const assoc = await post("/auth/mfa/associate", { session, username });
+        session = assoc.session; // use new session
+        const otpauth = assoc.otpauth_url;
+        $("#otpauth").textContent = otpauth;
+        $("#qr").src = "https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=" + encodeURIComponent(otpauth);
+        show("enroll", true);
+        setStatus("Scan the QR with Google/Microsoft Authenticator, then enter the 6-digit code.");
+      } else if (challenge === "SOFTWARE_TOKEN_MFA") {
+        show("mfa", true);
+        setStatus("Enter the 6-digit code from your authenticator app.");
+      } else {
+        setStatus("Unexpected challenge: " + challenge);
+      }
+
+    } catch (err) {
+      setStatus("Login error: " + err.message);
+    }
+  });
+
+
+  // Verify setup (first-time enrol)
+  $("#verifySetupForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    setStatus("Verifying TOTP and finishing setup…");
+    try {
+      const code = $("#totpSetup").value.trim();
+      const done = await post("/auth/mfa/verify_setup", { username, code, session });
+      idToken = done.id_token;
+      localStorage.setItem('jwt', idToken);        // save for the main UI
+      $("#tokenOut").textContent = idToken;
+      show("enroll", false);
+      show("authed", true);
+      setStatus("MFA setup complete. Signed in.");
+    } catch (err) {
+      setStatus("Verify setup error: " + err.message);
+    }
+  });
+
+  // Verify on login (subsequent logins)
+  $("#verifyLoginForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    setStatus("Verifying TOTP for login…");
+    try {
+      const code = $("#totpLogin").value.trim();
+      const done = await post("/auth/mfa/verify_login", { username, code, session });
+      idToken = done.id_token;
+      localStorage.setItem('jwt', idToken);        // save for the main UI
+      $("#tokenOut").textContent = idToken;
+      show("mfa", false);
+      show("authed", true);
+      setStatus("Signed in with MFA.");
+    } catch (err) {
+      setStatus("Verify login error: " + err.message);
+    }
+  });
+
+  // Call a protected API with the ID token
+  $("#callApiBtn").addEventListener("click", async () => {
+    try {
+      const res = await fetch(API_BASE() + "/videos", {
+        headers: { "Authorization": "Bearer " + idToken }
+      });
+      const text = await res.text();
+      alert(`GET /videos → ${res.status}\n\n${text.slice(0, 600)}`);
+    } catch (e) {
+      alert("Call failed: " + e.message);
+    }
+  });
+  
+  // ====== CONFIG ======
+  const COG_DOMAIN = "https://ap-southeast-2aa6gssxds.auth.ap-southeast-2.amazoncognito.com";
+  const CLIENT_ID  = "3d5ph6so0pahtghqrqgflmkd9c";   // from Cognito → App clients
+
+  // Where Cognito will send the tokens back to (our simple catcher page)
+  const REDIRECT_URI = location.origin + "/web/social.html";
+
+  document.getElementById("googleBtn").onclick = () => {
+    const url = COG_DOMAIN + "/oauth2/authorize"
+      + "?client_id=" + encodeURIComponent(CLIENT_ID)
+      + "&response_type=token"
+      + "&redirect_uri=" + encodeURIComponent(REDIRECT_URI)
+      + "&scope=openid+email+profile"
+      + "&identity_provider=Google"
+      + "&prompt=select_account";
+    location.href = url;
+  };
+
+  document.getElementById("logoutBtn").onclick = () => {
+    // (optional) clear local storage so your app shows Logged out immediately
+    localStorage.removeItem("jwt");
+    localStorage.removeItem("access_token");
+
+    const logoutUrl =
+      COG_DOMAIN + "/logout" +
+      "?client_id=" + encodeURIComponent(CLIENT_ID) +
+      "&logout_uri=" + encodeURIComponent(LOGOUT_REDIRECT);
+    
+      // send the browser to Cognito to clear the Hosted UI session cookie
+    location.href = logoutUrl;
+    };
+
+</script>
+</body>
+</html>

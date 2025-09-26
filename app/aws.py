@@ -82,6 +82,7 @@ def ddb_list_videos(user_email: str, limit: int = 25, last_key=None):
         "KeyConditionExpression": "#pk = :u",
         "ExpressionAttributeNames": {"#pk": "qut-username"},
         "ExpressionAttributeValues": {":u": {"S": user_email}},
+        # "ExpressionAttributeValues": {":u": {"S": "n9426825@qut.edu.au"}},
         "ScanIndexForward": False,  # newest first (by sort key = video_id or created_at GSI if you have one)
         "Limit": limit,
     }

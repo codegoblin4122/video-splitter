@@ -58,8 +58,28 @@
     <button id="loginBtn">Login</button>
     <button id="logoutBtn">Logout</button>
     <div class="status" id="authStatus">Logged out</div>
-    <div class="small">Use admin/admin123 or user/user123</div>
+    <div class="small">Use cognito sign in</div>
   </div>
+
+  <div class="section" id="mfaOpt" style="display:none;">
+  <h2>Optional MFA (TOTP)</h2>
+  <div id="mfaStep1">
+    <button id="startTotpBtn">Start TOTP enrolment</button>
+  </div>
+
+  <div id="mfaStep2" style="display:none;">
+    <p>Scan this QR with Google/Microsoft Authenticator:</p>
+    <img id="mfaQr" alt="TOTP QR" style="border:1px solid #ddd; padding:6px; border-radius:6px;" />
+    <p class="small">Or add manually:</p>
+    <code id="mfaOtpauth" class="small" style="word-break:break-all;"></code>
+    <div style="margin-top:8px;">
+      <input id="mfaCode" placeholder="6-digit code" />
+      <button id="verifyTotpBtn">Verify & enable</button>
+    </div>
+    <div id="mfaMsg" class="small"></div>
+  </div>
+</div>
+
 
   <div class="section">
     <h2>Upload Video</h2>
@@ -98,6 +118,15 @@
     <h3>Segments</h3>
     <button id="loadSegments">List Segments</button>
     <div id="segmentsGrid" class="list"></div>
+  </div>
+
+    <!-- Admin-only controls -->
+  <div id="adminPanel" style="display:none; border:1px solid #eee; padding:10px; margin:12px 0;">
+    <b>Admin tools</b>
+    <div style="margin-top:6px">
+      <button id="reindexBtn">Re-index</button>
+      <button id="purgeBtn">Purge all jobs</button>
+    </div>
   </div>
 
   <script>
@@ -342,8 +371,167 @@
       }catch(e){ alert(e.message); }
     }
 
+     document.getElementById('loginBtn').onclick = async () => {
+    const username = document.getElementById('username').value.trim();
+    const password = document.getElementById('password').value;
+    try {
+      const res = await fetch(apiBase()+"/auth/login", {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password })
+      });
+      if (!res.ok) throw new Error(await res.text());
+
+      const data = await res.json();
+
+      // If Cognito says MFA is required, send the user to the MFA page
+      if (data.challenge === "MFA_SETUP" || data.challenge === "SOFTWARE_TOKEN_MFA") {
+        // stash username/session so mfa.html can read them if you want to pass via storage
+        localStorage.setItem('mfa.username', username);
+        localStorage.setItem('mfa.session', data.session || "");
+        alert("MFA required. You'll finish sign-in on the MFA page.");
+        location.href = "/web/mfa.html";
+        return;
+      }
+
+      // Normal success: Cognito returns id_token / access_token
+      if (data.id_token) {
+        token = data.id_token;                         // <-- use the ID token
+        localStorage.setItem('jwt', token);            // what your app uses
+        // (optional) show something in the UI
+        role = "";                                     // you don't get a role from Cognito by default
+        setAuthStatus();
+        alert('Logged in (Cognito)');
+        return;
+      }
+
+      throw new Error("Unexpected login response");
+    } catch (e) {
+      alert('Login error: ' + (e.message || e));
+    }
+  };
+
     // Auto-load videos if logged in
     if(token){ loadVideos(); }
+
+    // Show Optional-MFA card if logged in (ID or access token present)
+(function initMfaCard(){
+  if (localStorage.getItem('jwt') || getAccessToken()) {
+    document.getElementById('mfaOpt').style.display = '';
+  }
+})();
+
+    // --- Access token helper (social.html stored this as 'access_token')
+function getAccessToken() {
+  return localStorage.getItem('access_token') || localStorage.getItem('oauth_access_token') || '';
+}
+
+async function postJSON(path, body){
+  const r = await fetch(apiBase()+path, {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(body||{})
+  });
+  if(!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+// Step 1: start enrolment (get secret + otpauth URL)
+document.getElementById('startTotpBtn').onclick = async () => {
+  const access = getAccessToken();
+  if (!access) { alert('Please sign in via Google/Cognito first'); return; }
+  try {
+    const assoc = await postJSON('/auth/mfa/associate_loggedin', { access_token: access });
+    document.getElementById('mfaStep1').style.display = 'none';
+    document.getElementById('mfaStep2').style.display = '';
+    document.getElementById('mfaOtpauth').textContent = assoc.otpauth_url;
+    document.getElementById('mfaQr').src =
+      'https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=' + encodeURIComponent(assoc.otpauth_url);
+    document.getElementById('mfaMsg').textContent = 'Scan the QR, then enter the 6-digit code.';
+  } catch(e){
+    alert('Associate failed: ' + e.message);
+  }
+};
+
+// Step 2: verify 6-digit and enable MFA
+document.getElementById('verifyTotpBtn').onclick = async () => {
+  const access = getAccessToken();
+  const code = (document.getElementById('mfaCode').value || '').trim();
+  if (!/^\d{6}$/.test(code)) { alert('Enter the 6-digit code'); return; }
+  try {
+    await postJSON('/auth/mfa/verify_loggedin', { access_token: access, code });
+    document.getElementById('mfaMsg').textContent = '✅ TOTP enabled. Next logins can use MFA.';
+    alert('MFA enabled for this user!');
+  } catch(e){
+    alert('Verify/enable failed: ' + e.message);
+  }
+};
+
+    // --- JWT helpers ---
+function parseJwt(token) {
+  if (!token) return null;
+  const parts = token.split('.');
+  if (parts.length !== 3) return null;
+  // base64url → base64
+  const base64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+  try {
+    const json = decodeURIComponent(
+      atob(base64)
+        .split('')
+        .map(c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2))
+        .join('')
+    );
+    return JSON.parse(json);
+  } catch {
+    return null;
+  }
+}
+
+function getIdToken() {
+  return localStorage.getItem('jwt') || '';
+}
+
+function getClaims() {
+  return parseJwt(getIdToken()) || {};
+}
+
+function userGroups() {
+  const claims = getClaims();
+  // Cognito sets "cognito:groups" when present
+  return claims['cognito:groups'] || [];
+}
+
+function isAdmin() {
+  return userGroups().includes('Admin');
+}
+
+// --- Wire up UI based on group ---
+(function setupAdminUi(){
+  const adminPanel = document.getElementById('adminPanel');
+  if (!adminPanel) return;
+
+  if (isAdmin()) {
+    adminPanel.style.display = '';
+    // Example click handlers:
+    document.getElementById('reindexBtn').onclick  = () => alert('Re-index kicked (demo)');
+    document.getElementById('purgeBtn').onclick    = () => alert('Purge kicked (demo)');
+  } else {
+    adminPanel.style.display = 'none';
+  }
+})();
+
+// (Optional) show auth state string with group info
+(function showAuthState(){
+  const el = document.getElementById('authStatus');
+  if (!el) return;
+  const claims = getClaims();
+  const groups = userGroups();
+  if (getIdToken()) {
+    el.textContent = `Logged in • groups: ${groups.join(', ') || '(none)'}`;
+  } else {
+    el.textContent = 'Logged out';
+  }
+})();
   </script>
 </body>
 </html>

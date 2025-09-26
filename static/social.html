@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Social login</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 32px; }
+    .card { border: 1px solid #e5e7eb; border-radius: 10px; padding: 16px; max-width: 680px; }
+    button { padding: 8px 14px; border: 1px solid #d1d5db; border-radius: 8px; cursor: pointer; }
+    .ok { color: #16a34a; }
+    .err { color: #dc2626; }
+    code { background: #f8fafc; padding: 2px 6px; border-radius:6px; }
+  </style>
+</head>
+<body>
+  <h1>Social sign-in</h1>
+  <div class="card">
+    <div id="msg">Processing tokens…</div>
+    <div style="margin-top:12px;">
+      <button onclick="goHome()">Open app</button>
+      <button onclick="show()">Show ID token</button>
+      <pre id="tok" style="display:none;white-space:pre-wrap;word-break:break-all;"></pre>
+    </div>
+  </div>
+
+<script>
+(function () {
+  // Parse tokens from the URL fragment (#id_token=...&access_token=...)
+  const hash = new URLSearchParams((location.hash || "").slice(1));
+  const idToken = hash.get("id_token");
+  const accessToken = hash.get("access_token");
+  const err = hash.get("error_description") || hash.get("error");
+
+  const msg = document.getElementById("msg");
+
+  if (err) {
+    msg.innerHTML = `<span class="err">Login error:</span> ${err}`;
+    return;
+  }
+
+  if (!idToken && !accessToken) {
+    msg.innerHTML =
+      `No tokens found in URL. Did you enable <code>Implicit grant</code> and set <code>response_type=token</code>?`;
+    return;
+  }
+
+  // Store for the app to use
+  if (idToken) localStorage.setItem("jwt", idToken);
+  if (accessToken) localStorage.setItem("access_token", accessToken);
+
+  msg.innerHTML = `<span class="ok">Signed in!</span> Token saved to <code>localStorage.jwt</code>.`;
+
+  // Clean the URL bar (remove #... fragment)
+  history.replaceState({}, document.title, location.pathname + location.search);
+
+  // Go back to the main UI (NOT the MFA page; MFA is for user-pool password logins)
+  location.replace("/web/index.html");
+})();
+
+function goHome(){ location.href = "/web/index.html"; }
+function show(){
+  const p = document.getElementById("tok");
+  p.textContent = localStorage.getItem("jwt") || "(no token)";
+  p.style.display = p.style.display === "none" ? "block" : "none";
+}
+</script>
+</body>
+</html>
