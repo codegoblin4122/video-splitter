@@ -29,7 +29,7 @@ Overview
 - **Why is this service suited to this data?:** [S3 is designed for large unstructured binary objects (videos) and scales efficiently for media workloads.]
 - **Why is are the other services used not suitable for this data?:** DynamoDB and Parameter Store are not suited for large binary file storage, and RDS would be inefficient and costly for blobs.
 - **Bucket/instance/table name:** n10254854-video-splitter
-- **Video timestamp:**
+- **Video timestamp:** 0.00
 - **Relevant files:**  
     - aws.py (s3_upload_stream, s3_get_to_file, s3_put_file, s3_presign_get)  
     - main.py (upload, download endpoints)
@@ -41,7 +41,7 @@ Overview
 - **Why is this service suited to this data? :** DynamoDB provides fast, serverless, key–value and document storage, ideal for structured metadata and frequent lookups by user/video.
 - **Why is are the other services used not suitable for this data?:** S3 doesn’t provide efficient querying, RDS would add unnecessary management overhead for simple key-value lookups.
 - **Bucket/instance/table name:** n10254854-videos (videos), n10254854-jobs (jobs)
-- **Video timestamp:**
+- **Video timestamp:** 1:03
 - **Relevant files:** 
     - aws.py (ddb_put_video, ddb_get_video, ddb_put_job, ddb_update_job_status, etc.) 
     - main.py (list_videos, job_status, etc.)
@@ -53,7 +53,7 @@ Overview
 - **Why is this service suited to this data?:** [Secure and centralised configuration management with caching and version control.]
 - **Why is are the other services used not suitable for this data?:** [S3 is not designed for secrets/config; DynamoDB is overkill for key-value configuration; RDS would be excessive.]
 - **Bucket/instance/table name:** /n10254854/video-splitter/prod/*
-- **Video timestamp:**
+- **Video timestamp:** 1:41
 - **Relevant files:** 
     - config.py (uses get_param from SSM) ssm_params.py
 
@@ -123,7 +123,7 @@ Overview
 ### Core - DNS with Route53
 
 - **Subdomain**:  [n10254854.cab432.com]
-- **Video timestamp:**
+- **Video timestamp:** 2:00
 
 ### Parameter store
 
