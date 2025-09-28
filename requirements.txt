@@ -4,3 +4,4 @@ boto3>=1.34
 PyJWT>=2.8
 python-multipart>=0.0.9
 requests>=2.31
+python-jose[cryptography]>=3.3.0
